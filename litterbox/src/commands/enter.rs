@@ -1,5 +1,5 @@
 use crate::{
-    daemon, files, mounts,
+    daemon, env, files, mounts,
     podman::{
         Container, commit_container, create_container, get_container, get_image,
         is_container_running, start_daemon, validate_container_prerequisites, wait_for_podman,
@@ -84,6 +84,23 @@ pub struct Command {
         action = clap::ArgAction::Append
     )]
     mount: Vec<PathBuf>,
+
+    /// Forward a preset group of environment variables from the host
+    #[arg(long = "env-preset", value_enum, action = clap::ArgAction::Append)]
+    env_preset: Vec<env::EnvPreset>,
+
+    /// Set an environment variable in the container (KEY=VALUE) or forward it from the host (KEY)
+    #[arg(short = 'e', long = "env", value_name = "ENV", action = clap::ArgAction::Append)]
+    env: Vec<String>,
+
+    /// Additional flags to pass directly to podman exec
+    #[arg(
+        long = "additional-flags",
+        value_name = "FLAGS",
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
+    )]
+    additional_flags: Vec<String>,
 
     #[clap(flatten)]
     opts: CommonEntrypointOptions,
@@ -268,15 +285,41 @@ impl Command {
                 .map(|mount| mount.container_path.clone())
         });
 
+        let mut env_vars = Vec::new();
+        for preset in &self.env_preset {
+            env_vars.extend(preset.resolve_env_vars());
+        }
+        for entry in &self.env {
+            if let Some(resolved) = env::resolve_env_arg(entry) {
+                env_vars.push(resolved);
+            } else {
+                debug!(
+                    "Environment variable '{entry}' is not set on the host; skipping forwarding"
+                );
+            }
+        }
+
+        let mut additional_flags = Vec::new();
+        for flags_str in &self.additional_flags {
+            let split_flags = shlex::split(flags_str).ok_or_else(|| {
+                anyhow!("Failed to parse --additional-flags: unmatched quote in '{flags_str}'")
+            })?;
+            additional_flags.extend(split_flags);
+        }
+
         tokio::runtime::Runtime::new()
             .expect("Tokio runtime should start")
             .block_on(container_exec_entrypoint(
                 container_id,
-                self.interactive,
-                self.tty,
-                workdir,
-                allow_paths,
-                self.opts,
+                ExecOptions {
+                    interactive: self.interactive,
+                    tty: self.tty,
+                    workdir,
+                    allow_paths,
+                    env_vars,
+                    additional_flags,
+                    opts: self.opts,
+                },
             ))?;
 
         files::remove_pid_from_session_lockfile(&session_lock, my_pid)?;
@@ -312,14 +355,17 @@ fn recreate_container(
     get_container(lbx_name)?.ok_or_else(|| anyhow!("No container found for '{lbx_name}'"))
 }
 
-async fn container_exec_entrypoint(
-    container_id: String,
+struct ExecOptions {
     interactive: Interactive,
     tty: Tty,
     workdir: Option<PathBuf>,
     allow_paths: Vec<PathBuf>,
+    env_vars: Vec<String>,
+    additional_flags: Vec<String>,
     opts: CommonEntrypointOptions,
-) -> Result<()> {
+}
+
+async fn container_exec_entrypoint(container_id: String, options: ExecOptions) -> Result<()> {
     use tokio::process::Command;
 
     let mut exec_child = Command::new("podman");
@@ -327,16 +373,16 @@ async fn container_exec_entrypoint(
     exec_child.arg("exec");
 
     // Assume -t if we are launching the login shell
-    if tty.0 || opts.command.is_none() {
+    if options.tty.0 || options.opts.command.is_none() {
         exec_child.arg("--tty");
     }
 
     // Assume -i if we are launching the login shell
-    if interactive.0 || opts.command.is_none() {
+    if options.interactive.0 || options.opts.command.is_none() {
         exec_child.arg("--interactive");
     }
 
-    if let Some(workdir) = workdir {
+    if let Some(workdir) = options.workdir {
         exec_child.arg("--workdir");
         exec_child.arg(workdir.into_os_string());
     }
@@ -344,6 +390,14 @@ async fn container_exec_entrypoint(
     // We always start as root but drop permissions later if needed
     exec_child.arg("--user");
     exec_child.arg("root");
+
+    for env_var in options.env_vars {
+        exec_child.args(["--env", &env_var]);
+    }
+
+    for flag in options.additional_flags {
+        exec_child.arg(flag);
+    }
 
     exec_child.args([
         &container_id,
@@ -354,24 +408,24 @@ async fn container_exec_entrypoint(
         "--gid",
         &getgid().to_string(),
         "--wait",
-        &opts.wait.to_string(),
+        &options.opts.wait.to_string(),
     ]);
 
     // Mounted project directories live outside the container's home mount, so
     // Landlock needs an explicit rule for each one.
-    for path in allow_paths {
+    for path in options.allow_paths {
         exec_child.arg("--allow").arg(path);
     }
 
     // The entrypoint is responsible for dropping root if needed
-    if opts.root {
+    if options.opts.root {
         exec_child.arg("--root");
     }
 
-    if let Some(command) = opts.command {
+    if let Some(command) = options.opts.command {
         exec_child.arg("--");
         exec_child.arg(command);
-        exec_child.args(opts.args);
+        exec_child.args(options.opts.args);
     }
 
     let mut exec_child = exec_child.spawn().context("Failed to run podman command")?;
@@ -441,5 +495,46 @@ mod tests {
         let command = parse(&["enter", "dev"]);
 
         assert!(command.mount.is_empty());
+    }
+
+    #[test]
+    fn env_flags_parse_and_repeat() {
+        let command = parse(&["enter", "dev", "-e", "FOO=BAR", "--env", "BAZ"]);
+
+        assert_eq!(command.env, vec!["FOO=BAR", "BAZ"]);
+    }
+
+    #[test]
+    fn env_presets_parse_and_repeat() {
+        let command = parse(&[
+            "enter",
+            "dev",
+            "--env-preset",
+            "term",
+            "--env-preset",
+            "locale",
+        ]);
+
+        assert_eq!(
+            command.env_preset,
+            vec![env::EnvPreset::Term, env::EnvPreset::Locale]
+        );
+    }
+
+    #[test]
+    fn additional_flags_parse_and_repeat() {
+        let command = parse(&[
+            "enter",
+            "dev",
+            "--additional-flags",
+            "--privileged --cap-add=NET_ADMIN",
+            "--additional-flags",
+            "-e EXTRA=1",
+        ]);
+
+        assert_eq!(
+            command.additional_flags,
+            vec!["--privileged --cap-add=NET_ADMIN", "-e EXTRA=1"]
+        );
     }
 }

@@ -2817,6 +2817,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
+ "shlex",
  "strum",
  "strum_macros",
  "tabled",
