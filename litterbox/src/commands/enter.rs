@@ -279,25 +279,15 @@ impl Command {
 
         drop(mount_lock);
 
-        let workdir = self.workdir.or_else(|| {
+        let workdir = resolve_workdir(
+            self.workdir,
             requested_mounts
                 .first()
-                .map(|mount| mount.container_path.clone())
-        });
+                .map(|mount| mount.container_path.clone()),
+            self.opts.root,
+        );
 
-        let mut env_vars = Vec::new();
-        for preset in &self.env_preset {
-            env_vars.extend(preset.resolve_env_vars());
-        }
-        for entry in &self.env {
-            if let Some(resolved) = env::resolve_env_arg(entry) {
-                env_vars.push(resolved);
-            } else {
-                debug!(
-                    "Environment variable '{entry}' is not set on the host; skipping forwarding"
-                );
-            }
-        }
+        let env_vars = resolve_enter_env_vars(&self.env_preset, &self.env, self.opts.root);
 
         let mut additional_flags = Vec::new();
         for flags_str in &self.additional_flags {
@@ -353,6 +343,38 @@ fn recreate_container(
     create_container(lbx_name, &container_name, &image_name, settings)?;
 
     get_container(lbx_name)?.ok_or_else(|| anyhow!("No container found for '{lbx_name}'"))
+}
+
+fn resolve_workdir(
+    explicit_workdir: Option<PathBuf>,
+    first_mount_path: Option<PathBuf>,
+    is_root: bool,
+) -> Option<PathBuf> {
+    explicit_workdir
+        .or(first_mount_path)
+        .or_else(|| is_root.then(|| PathBuf::from("/root")))
+}
+
+fn resolve_enter_env_vars(
+    presets: &[env::EnvPreset],
+    custom_envs: &[String],
+    is_root: bool,
+) -> Vec<String> {
+    let mut env_vars = Vec::new();
+    for preset in presets {
+        env_vars.extend(preset.resolve_env_vars());
+    }
+    for entry in custom_envs {
+        if let Some(resolved) = env::resolve_env_arg(entry) {
+            env_vars.push(resolved);
+        } else {
+            debug!("Environment variable '{entry}' is not set on the host; skipping forwarding");
+        }
+    }
+    if is_root && !env_vars.iter().any(|v| v.starts_with("HOME=")) {
+        env_vars.push("HOME=/root".to_string());
+    }
+    env_vars
 }
 
 struct ExecOptions {
@@ -536,5 +558,48 @@ mod tests {
             command.additional_flags,
             vec!["--privileged --cap-add=NET_ADMIN", "-e EXTRA=1"]
         );
+    }
+
+    #[test]
+    fn resolve_workdir_precedence() {
+        // Without root, no default workdir
+        assert_eq!(resolve_workdir(None, None, false), None);
+
+        // With root, defaults to /root
+        assert_eq!(
+            resolve_workdir(None, None, true),
+            Some(PathBuf::from("/root"))
+        );
+
+        // Mount overrides root default
+        assert_eq!(
+            resolve_workdir(None, Some(PathBuf::from("/home/user/shared/myproj")), true),
+            Some(PathBuf::from("/home/user/shared/myproj"))
+        );
+
+        // Explicit workdir overrides both mount and root default
+        assert_eq!(
+            resolve_workdir(
+                Some(PathBuf::from("/custom")),
+                Some(PathBuf::from("/home/user/shared/myproj")),
+                true
+            ),
+            Some(PathBuf::from("/custom"))
+        );
+    }
+
+    #[test]
+    fn resolve_enter_env_vars_root_handling() {
+        // Non-root does not inject HOME=/root
+        let vars = resolve_enter_env_vars(&[], &[], false);
+        assert!(!vars.iter().any(|v| v.starts_with("HOME=")));
+
+        // Root injects HOME=/root by default
+        let vars = resolve_enter_env_vars(&[], &[], true);
+        assert_eq!(vars, vec!["HOME=/root"]);
+
+        // Explicit HOME argument is preserved and not overridden
+        let vars = resolve_enter_env_vars(&[], &["HOME=/custom/dir".to_string()], true);
+        assert_eq!(vars, vec!["HOME=/custom/dir"]);
     }
 }

@@ -68,7 +68,9 @@ impl Command {
             sandbox::apply_landlock(&self.allow)?;
         }
 
-        files::setup_home()?;
+        if !self.opts.root {
+            files::setup_home()?;
+        }
 
         let mut cmd = Command::new(&env::shell()?);
         cmd.stderr(Stdio::inherit());
@@ -77,6 +79,15 @@ impl Command {
         // $RUST_LOG can be passed from `litterbox build` for development and
         // debugging purposes. We don't want child processes to inherit it.
         cmd.env_remove("RUST_LOG");
+
+        if self.opts.root {
+            // Ensure HOME points to /root if it was not already updated or overridden.
+            if std::env::var("HOME").is_err()
+                || std::env::var("HOME").as_deref() == Ok("/home/user")
+            {
+                cmd.env("HOME", "/root");
+            }
+        }
 
         // Have the shell assume it's a login shell.
         cmd.arg("-l");
