@@ -13,6 +13,7 @@ eframe = "0.37"
 egui_extras = { version = "0.37", features = ["svg"] }
 env_logger = "0.11"
 futures = "0.3"
+iana-time-zone = "0.1"
 inquire = "0.9"
 inquire-derive = "0.9"
 landlock = "0.4"
