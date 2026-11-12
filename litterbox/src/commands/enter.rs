@@ -86,7 +86,7 @@ pub struct Command {
     mount: Vec<PathBuf>,
 
     /// Forward a preset group of environment variables from the host
-    #[arg(long = "env-preset", value_enum, action = clap::ArgAction::Append)]
+    #[arg(long = "env-preset", value_enum, action = clap::ArgAction::Append, value_delimiter = ',')]
     env_preset: Vec<env::EnvPreset>,
 
     /// Set an environment variable in the container (KEY=VALUE) or forward it from the host (KEY)
@@ -535,11 +535,38 @@ mod tests {
             "term",
             "--env-preset",
             "locale",
+            "--env-preset",
+            "time",
         ]);
 
         assert_eq!(
             command.env_preset,
-            vec![env::EnvPreset::Term, env::EnvPreset::Locale]
+            vec![
+                env::EnvPreset::Term,
+                env::EnvPreset::Locale,
+                env::EnvPreset::Time
+            ]
+        );
+    }
+
+    #[test]
+    fn env_preset_timezone_alias() {
+        let command = parse(&["enter", "dev", "--env-preset", "timezone"]);
+
+        assert_eq!(command.env_preset, vec![env::EnvPreset::Time]);
+    }
+
+    #[test]
+    fn env_presets_comma_separated() {
+        let command = parse(&["enter", "dev", "--env-preset", "term,locale,time"]);
+
+        assert_eq!(
+            command.env_preset,
+            vec![
+                env::EnvPreset::Term,
+                env::EnvPreset::Locale,
+                env::EnvPreset::Time
+            ]
         );
     }
 
